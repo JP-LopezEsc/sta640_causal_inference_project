@@ -15,7 +15,7 @@ library(tidyverse)
 The data was obtain from Kaggle. The treatment variables are Tech.Support and Discount, the outcome is Revenue, and the other variables will be used as covariates.
 
 ```{r}
-df <- read.csv('data/multi_attribution_sample.csv')
+df <- read.csv("https://raw.githubusercontent.com/JP-LopezEsc/sta640_causal_inference_project/main/data/multi_attribution_sample.csv")
 head(df)
 summary(df)
 colSums(is.na(df)) # no missing values
