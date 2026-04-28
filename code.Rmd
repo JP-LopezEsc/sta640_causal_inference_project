@@ -1,0 +1,589 @@
+---
+title: "Code for STA 640 final project"
+author: "Juan Pablo López Escamilla"
+date: "2026-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+# Read data and quick EDA
+
+The data was obtain from Kaggle. The treatment variables are Tech.Support and Discount, the outcome is Revenue, and the other variables will be used as covariates.
+
+```{r}
+df <- read.csv('data/multi_attribution_sample.csv')
+head(df)
+summary(df)
+colSums(is.na(df)) # no missing values
+```
+
+We have around 500 observations for each of the 4 different treatment combinations:
+
+```{r}
+sum(df$Tech.Support)
+sum(df$Discount)
+table(df[c('Tech.Support', 'Discount')])
+```
+
+
+There is a clear association between both treatments and the revenue:
+
+```{r}
+# Boxplot: Tech Support vs Revenue
+ggplot(df, aes(x = factor(Tech.Support), y = Revenue)) +
+  geom_boxplot() +
+  labs(x = "Tech Support", y = "Revenue",
+       title = "Revenue by Tech Support") +
+  theme_minimal()
+
+# Boxplot: Discount vs Revenue
+ggplot(df, aes(x = factor(Discount), y = Revenue)) +
+  geom_boxplot() +
+  labs(x = "Discount", y = "Revenue",
+       title = "Revenue by Discount") +
+  theme_minimal()
+```
+
+
+Revenue difference under different treatment settings (THIS IS NOT A CAUSAL EFFECT):
+
+```{r}
+mean(df$Revenue[df$Tech.Support == 1 & df$Discount == 1]) - 
+  mean(df$Revenue[df$Tech.Support == 0 & df$Discount == 0])
+```
+
+If the treatment assignment was randomized, we could conclude that the ATE between receiving both treatments and no treatment is $20198. However, the treatment assignment may not be randomized, so we need to use other techniques to estimate the causal effects.
+
+## Propensity score
+
+### Overlap and balance check
+
+First, we estimate the propensity scores for each treatment combination using a multinomial logistic regression model. We then assess the overlap assumption by comparing the density distributions of the estimated propensity scores across the four treatment combinations. After that, we check covariate balance 
+
+```{r}
+library(PSweight)
+
+# Combine two binary treatments into one factor with 4 levels
+df$trt <- ifelse(df$Tech.Support == 0 & df$Discount == 0, 'No treatment',
+                 ifelse(df$Tech.Support == 1 & df$Discount == 0, "Tech Support only",
+                        ifelse(df$Tech.Support == 0 & df$Discount == 1, "Discount only",
+                               "Both treatments")))
+
+# Define propensity score formula
+ps_formula <- trt ~ Global.Flag + Major.Flag + SMC.Flag + Commercial.Flag + 
+                    IT.Spend + Employee.Count + PC.Count + Size
+
+# Fit a multinomial logistic regression
+balance_ps <- SumStat(ps.formula = ps_formula, 
+                      weight = c('IPW','overlap','treated'),
+                      data = df)
+
+ps_df <- as.data.frame(balance_ps$propensity)
+ps_df$actual_trt <- df$trt
+
+ps_long <- as.data.frame(balance_ps$propensity) |>
+  mutate(actual_trt = df$trt) |>
+  pivot_longer(-actual_trt,
+               names_to = "ps_group",
+               values_to = "ps")
+
+ggplot(ps_long,
+       aes(x = ps, color = actual_trt, linetype = actual_trt)) +
+  geom_density(size = 1) +
+  facet_wrap(~ps_group, scales = "free") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw(base_size = 16) +
+  labs(
+    x = "Propensity score",
+    color = "Actual treatment",
+    linetype = "Actual treatment"
+  )
+```
+
+Checking covariance balance using ASD, we see that size and IT spend were particularly unbalanced before the weighting. All weighting methods are succesful to balance all the covariates.
+
+```{r}
+plot(balance_ps, type = "balance", metric = "ASD")
+```
+
+In the following plots it is clear that the company tends to apply both treatments to companies that have bigger size and IT spend, which means they may have a strategy of allocating more efforts to larger companies:
+
+```{r}
+ggplot(df, aes(x = IT.Spend, y = trt, fill = trt)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Treatment Assignment by IT Spend",
+       x = "IT Spend",
+       y = "Treatment Group") +
+  theme(legend.position = "none")
+
+
+ggplot(df, aes(x = Size, y = trt, fill = trt)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Treatment Assignment by Company Size",
+       x = "Size",
+       y = "Treatment Group") +
+  theme(legend.position = "none")
+```
+
+
+Since the four treatment groups are not comparable, we apply different weighting mechanisms to balance the covariates in the following sections.
+
+### Overlap weights
+
+
+```{r}
+set.seed(0)
+ate_overlap <- PSweight(ps.formula = ps_formula, 
+                         yname = "Revenue", 
+                         data = df,
+                         weight = 'overlap',
+                         bootstrap = TRUE,
+                         R=100)
+
+contrasts <- rbind(c(1,-1,0,0),c(1,0,-1,0),c(1,0,0,-1),c(0,1,-1,0),
+                        c(0,1,0,-1),c(0,0,-1,1))
+
+summary(ate_overlap, contrast = contrasts)
+```
+
+### IPW
+
+```{r}
+ate_ipw <- PSweight(ps.formula = ps_formula, 
+                         yname = "Revenue", 
+                         data = df,
+                         weight = 'IPW',
+                         bootstrap = TRUE,
+                         R=100)
+
+summary(ate_ipw, contrast = contrasts)
+```
+
+### ATT
+
+```{r}
+ate_treated <- PSweight(ps.formula = ps_formula, 
+                         yname = "Revenue", 
+                         data = df,
+                         weight = 'treated',
+                         bootstrap = TRUE,
+                         R=100)
+
+summary(ate_treated, contrast = contrasts)
+```
+
+### Doubly robust (DR)
+
+```{r}
+out_formula <- Revenue ~ Global.Flag + Major.Flag + SMC.Flag + Commercial.Flag + 
+                    IT.Spend + Employee.Count + PC.Count + Size
+ate_dr <- PSweight(ps.formula = ps_formula, 
+                        out.formula = out_formula,
+                         yname = "Revenue", 
+                         data = df,
+                         weight = 'IPW',
+                         augmentation = TRUE,
+                         bootstrap = TRUE,
+                         R=100)
+
+summary(ate_dr, contrast = contrasts)
+```
+
+## Optimal trimming
+
+Trimming is important because in the propensity scores overlap plot it is clear that some propensity scores are extremely small, so the IPW weights will be extreme as well. We apply optimal trimming and show how many units remain after trimming.
+
+```{r}
+opt_trim <- PStrim(ps.formula = ps_formula, data = df, optimal = TRUE)
+opt_trim$trim_sum
+```
+
+The covariates are balanced, and the propensity scores are less extreme after trimming.
+
+```{r}
+# trimmed data
+opt_trim_df <- opt_trim$data
+
+#Check the overlap
+balance_trim <- SumStat(ps.formula = ps_formula,
+                             weight = c('IPW','overlap','treated'),
+                             data = opt_trim_df)
+
+ps_long_trim <- as.data.frame(balance_trim$propensity) |>
+  mutate(actual_trt = opt_trim_df$trt) |>
+  pivot_longer(-actual_trt,
+               names_to = "ps_group",
+               values_to = "ps")
+
+ggplot(ps_long_trim,
+       aes(x = ps, color = actual_trt, linetype = actual_trt)) +
+  geom_density(size = 1) +
+  facet_wrap(~ps_group, scales = "free") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw(base_size = 16) +
+  labs(
+    x = "Propensity score",
+    color = "Actual treatment",
+    linetype = "Actual treatment"
+  )
+
+#Covariates balance after trimming
+plot(balance_trim, type = "balance", metric = "ASD")
+```
+
+With this trimmed data we can re-estimate the causal effects with IPW.
+
+### Trimmed IPW
+
+```{r}
+ate_ipw_trim <- PSweight(ps.formula = ps_formula, 
+                         yname = "Revenue", 
+                         data = opt_trim_df,
+                         weight = 'IPW',
+                         bootstrap = TRUE,
+                         R=100)
+
+summary(ate_ipw_trim, contrast = contrasts)
+```
+
+
+### Trimmed Doubly robust (DR)
+
+```{r}
+ate_dr_trim <- PSweight(ps.formula = ps_formula, 
+                        out.formula = out_formula,
+                         yname = "Revenue", 
+                         data = opt_trim_df,
+                         weight = 'IPW',
+                         augmentation = TRUE,
+                         bootstrap = TRUE,
+                         R=100)
+
+summary(ate_dr_trim, contrast = contrasts)
+```
+
+
+## Tables
+
+Create tables to sumarize the results from the code above:
+
+```{r}
+
+contrast_names <- paste0("Contrast ", 1:6)
+
+# extract function
+extract_psw <- function(model, method_name, contrasts, trimmed = FALSE) {
+  s <- summary(model, contrast = contrasts)
+
+  tab <- as.data.frame(s$estimates)
+
+  tab$Method <- method_name
+  tab$Trimmed <- if (trimmed) "Trimmed" else "Untrimmed"
+  tab$Contrast <- rownames(tab)
+
+  rownames(tab) <- NULL
+  tab
+}
+
+
+# build full results table
+all_results <- rbind(
+
+  # ---------------- untrimmed ----------------
+  extract_psw(ate_ipw, "IPW", contrasts, FALSE),
+  extract_psw(ate_overlap, "Overlap", contrasts, FALSE),
+  extract_psw(ate_treated, "ATT", contrasts, FALSE),
+  extract_psw(ate_dr, "DR", contrasts, FALSE),
+
+  # ---------------- trimmed ----------------
+  extract_psw(ate_ipw_trim, "IPW", contrasts, TRUE),
+  extract_psw(ate_dr_trim, "DR", contrasts, TRUE)
+)
+
+
+# Keep only relevant columns
+all_results <- all_results[, c(
+  "Contrast", "Method", "Trimmed",
+  "Estimate", "Std.Error",
+  "lwr", "upr", "Pr(>|z|)"
+)]
+
+
+# Ordering
+method_order <- c("IPW", "Overlap", "ATT", "DR")
+trim_order <- c("Untrimmed", "Trimmed")
+
+all_results$Method <- factor(all_results$Method, levels = method_order)
+all_results$Trimmed <- factor(all_results$Trimmed, levels = trim_order)
+
+all_results <- all_results %>%
+  arrange(Contrast, Method, Trimmed)
+
+
+# split into 6 tables
+tables <- split(all_results, all_results$Contrast)
+
+tables <- lapply(tables, function(df) {
+  df %>%
+    arrange(Method, Trimmed)
+})
+
+# Print tables
+for (nm in names(tables)) {
+  cat("\n\n====================\n", nm, "\n====================\n")
+  print(tables[[nm]])
+}
+```
+
+
+# CATE
+
+In order to fully exploit this data, it is necessary to estimate the conditional average treatment effect given the covariates, which would allow us to create strategies to target the companies that are expected to generate more revenue when we apply the treatments to them.
+
+Since we have multiple treatments, we can apply a multi-arm/multi-outcome causal forest using the grf package.
+
+```{r}
+
+library(grf)
+
+# W must be a factor
+df$W <- as.factor(df$trt)
+# Set "No treatment" as the reference level
+df$W <- relevel(df$W, ref = "No treatment")
+
+X <- as.matrix(df[, c("Global.Flag", "Major.Flag", "SMC.Flag", "Commercial.Flag", 
+                      "IT.Spend", "Employee.Count", "PC.Count", "Size")])
+
+# Train the multi-arm forest
+mc_forest <- multi_arm_causal_forest(X = X, 
+                                     Y = df$Revenue, 
+                                     W = df$W)
+
+mc_pred <- predict(mc_forest, drop = TRUE)
+tau_hat <- mc_pred$predictions
+```
+
+In the following plot, we can see that the CATE is quite heterogeneous; therefore, the same treatment can have a very different effect on revenue depending on the characteristics of the companies.
+
+```{r}
+
+df_tau <- as.data.frame(tau_hat)
+df_tau_long <- df_tau %>% 
+  pivot_longer(everything(), names_to = "Contrast", values_to = "Effect")
+
+ggplot(df_tau_long, aes(x = Effect, fill = Contrast)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Distribution of CATEs",
+       subtitle = "Relative to 'No treatment' baseline",
+       x = "Estimated Effect on Revenue")
+```
+
+Obtaining feature importance from the causal forest reveals that Size and IT.Spend are the most significant covariates. Notably, these two variables also exhibited the most imbalance across the treatment groups.
+
+```{r}
+vi <- variable_importance(mc_forest)
+names(vi) <- colnames(X) # Ensure X is your covariate matrix
+
+vi_df <- data.frame(Feature = names(vi), Importance = vi)
+ggplot(vi_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Key Drivers of Treatment Effect Heterogeneity",
+       x = "Covariates", y = "Variable Importance Score")
+```
+
+The following plots show the relationship between company size, IT spend and CATE. It is clear that the treatments generate larger revenues when the company size is big and the IT spend is also big. This shows that the strategy of giving both treatments mainly to big companies with large IT spend makes sense. 
+
+```{r}
+plot_df <- cbind(df, as.data.frame(tau_hat))
+
+plot_df_long <- plot_df %>%
+  pivot_longer(cols = colnames(tau_hat), 
+               names_to = "Contrast", 
+               values_to = "CATE")
+
+ggplot(plot_df_long, aes(x = IT.Spend, y = CATE, color = Contrast)) +
+  geom_point(alpha = 0.2) + 
+  geom_smooth(method = "gam", se = FALSE, 
+              formula = y ~ s(x, bs = "cs", k = 40)) +
+  theme_minimal() +
+  labs(title = "CATE vs. IT Spend",
+       subtitle = "How treatment effects vary by IT investment",
+       x = "IT Spend",
+       y = "CATE")
+
+ggplot(plot_df_long, aes(x = Size, y = CATE, color = Contrast)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "gam", se = FALSE, 
+              formula = y ~ s(x, bs = "cs", k = 40)) +
+  theme_minimal() +
+  labs(title = "CATE vs. Company Size",
+       subtitle = "How treatment effects vary by company size",
+       x = "Company Size",
+       y = "CATE")
+```
+
+# Treatment assignment optimization
+
+There are several ways to exploit the causal forest model for decision-making. We consider a setting in which treatments have associated costs: offering a discount costs \$6000, technical support costs \$7000, so offering both treatments costs \$13000. The no-treatment option has zero cost. The objective is to determine an optimal treatment allocation rule that maps covariates to treatments in order to maximize expected net revenue subject to a total budget constraint.
+
+Under the observed assignment, the total cost of treatments in the data is \$13,168,000.
+
+Using the estimated CATEs, we assign treatments based on covariates to maximize expected net value. We define the unit-level net value of treatment $k$ as
+\[
+\text{net}_k(X) = \tau_k(X) - c_k,
+\]
+where $c_k$ denotes the cost of treatment $k$, and $\tau_k(X) = \mathbb{E}[Y(k) - Y(0)\mid X]$ is the conditional average treatment effect relative to the no-treatment baseline. Thus, $\text{net}_k(X)$ represents the expected incremental profit of assigning treatment $k$ to a unit with characteristics $X$.
+
+The optimal assignment is then obtained by solving the constrained optimization problem:
+
+$$\arg\max_{d_{ik}} \sum_{i=1}^n \sum_{k} d_{ik}\,\text{net}_k(X_i),
+\quad \text{s.t.} \quad \sum_k d_{ik} = 1,\ \sum_{i,k} d_{ik} c_k \le B,$$
+
+with $d_{ik}$ in $\{0,1\}$, which is a binary decision variable equal to 1 if unit $i$ is assigned to treatment $k$, and 0 otherwise. $B$ is the maximum total cost allowed.
+
+Finally, we evaluate the optimized treatment assignment by comparing its expected performance against the observed treatment assignment using the same CATE-based net value framework. The expected gains from the optimized allocation is \$4,307,291, while the expected gains under the observed allocation is \$1,225,866. This shows that using the causal forest model to learn a optimize the treatment allocation has a big potential of increasing the revenue. For future observations, we could use the causal forest to estimate the CATEs based on their covariates, and then solve the optimization problem to assign treatments in a way that maximizes expected net profit under the budget constraint.
+
+
+
+```{r}
+library(lpSolve)
+
+# ----------------------------
+# Costs
+# ----------------------------
+
+treatment_cost <- c(
+  "No treatment" = 0,
+  "Discount only" = 6000,
+  "Tech Support only" = 7000,
+  "Both treatments" = 13000
+)
+
+# ----------------------------
+# Net value (tau - cost)
+# ----------------------------
+
+net_value <- cbind(
+  "No treatment" = 0,
+  "Discount only" = tau_hat[, "Discount only - No treatment"] - treatment_cost["Discount only"],
+  "Tech Support only" = tau_hat[, "Tech Support only - No treatment"] - treatment_cost["Tech Support only"],
+  "Both treatments" = tau_hat[, "Both treatments - No treatment"] - treatment_cost["Both treatments"]
+)
+
+n_units <- nrow(net_value)
+n_treatments <- ncol(net_value)
+
+colnames(net_value) <- names(treatment_cost)
+
+# Objective vector (maximize total net value)
+objective_vec <- as.vector(t(net_value))
+
+
+# ----------------------------
+# Constraints
+# ----------------------------
+
+# (A) each unit gets exactly one treatment
+assignment_matrix <- matrix(0, nrow = n_units, ncol = n_units * n_treatments)
+
+for (i in 1:n_units) {
+  assignment_matrix[i, ((i - 1) * n_treatments + 1):(i * n_treatments)] <- 1
+}
+
+assignment_dir <- rep("=", n_units)
+assignment_rhs <- rep(1, n_units)
+
+
+# total budget constraint (from observed data)
+budget_limit <- sum(
+  (df$Discount == 1 & df$Tech.Support == 0) * 6000 +
+  (df$Discount == 0 & df$Tech.Support == 1) * 7000 +
+  (df$Discount == 1 & df$Tech.Support == 1) * 13000
+)
+
+cost_vector <- as.vector(t(matrix(rep(treatment_cost, each = n_units), nrow = n_units)))
+
+budget_matrix <- matrix(cost_vector, nrow = 1)
+budget_dir <- "<="
+budget_rhs <- budget_limit
+
+
+# ----------------------------
+# Solve ILP
+# ----------------------------
+
+solution <- lp(
+  direction = "max",
+  objective.in = objective_vec,
+  const.mat = rbind(assignment_matrix, budget_matrix),
+  const.dir = c(assignment_dir, budget_dir),
+  const.rhs = c(assignment_rhs, budget_rhs),
+  all.bin = TRUE
+)
+
+
+# ----------------------------
+# Extract policy
+# ----------------------------
+
+decision_matrix <- matrix(solution$solution, nrow = n_units, byrow = TRUE)
+colnames(decision_matrix) <- names(treatment_cost)
+
+optimal_policy <- colnames(decision_matrix)[max.col(decision_matrix)]
+
+
+# ----------------------------
+# Policy evaluation (net value)
+# ----------------------------
+
+selected_net_value <- net_value[
+  cbind(1:n_units, match(optimal_policy, colnames(net_value)))
+]
+
+total_net_value_optimal <- sum(selected_net_value)
+
+
+# ----------------------------
+# Observed policy evaluation
+# ----------------------------
+
+get_net_value <- function(treatment, i) {
+
+  if (treatment == "No treatment") return(0)
+
+  tau_col <- paste0(treatment, " - No treatment")
+
+  tau_hat[i, tau_col] - treatment_cost[treatment]
+}
+
+total_net_value_observed <- sum(
+  sapply(1:nrow(df), function(i) {
+    get_net_value(df$W[i], i)
+  })
+)
+
+
+# ----------------------------
+# Outputs
+# ----------------------------
+
+table(optimal_policy)
+
+total_net_value_optimal
+total_net_value_observed
+total_net_value_optimal - total_net_value_observed
+
+total_net_value_optimal/total_net_value_observed
+```
+
+
+
